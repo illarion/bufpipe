@@ -2,31 +2,65 @@ package bufpipe
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 )
 
-type Pipe struct {
-	maxSize int
-	buf     *bytes.Buffer
-	flag    chan struct{}
-	closed  chan struct{}
-	err     error
+var (
+	// ErrBufferFull is returned when the buffer is full
+	ErrBufferFull = errors.New("bufpipe: buffer full")
+	// ErrClosedPipe is returned when the pipe is closed
+	ErrClosedPipe = errors.New("bufpipe: closed pipe")
+)
+
+const defaultBufSize = 4096
+
+type pipe struct {
+	maxSize        int
+	blockOnMaxSize bool
+	buf            *bytes.Buffer
+	flag           chan struct{}
+	closed         chan struct{}
+	err            error
 
 	mu sync.Mutex
 }
 
-func New(maxSize int) *Pipe {
-	return &Pipe{
+type PipeReader interface {
+	io.Reader
+	io.Closer
+}
+
+type PipeWriter interface {
+	io.Writer
+	io.Closer
+	Len() int
+}
+
+// Pipe creates a buffered in-memory pipe. It can be used to connect code expecting an io.Reader with
+// code expecting an io.Writer, but unlike io.Pipe it has internal buffer and can be used to pass
+// data between goroutines without blocking. If maxSize > 0, the buffer will be limited to that size, and
+// Write will return ErrBufferFull if the buffer is full. If maxSize is 0, buffer is unlimited.
+func Pipe(maxSize int) (PipeReader, PipeWriter) {
+	size := maxSize
+	if maxSize <= 0 {
+		size = defaultBufSize
+	}
+	buf := make([]byte, 0, size)
+
+	p := &pipe{
 		maxSize: maxSize,
-		buf:     bytes.NewBuffer(make([]byte, 0, maxSize)),
+		buf:     bytes.NewBuffer(buf),
 		flag:    make(chan struct{}, 1),
 		closed:  make(chan struct{}),
 		err:     nil,
 	}
+
+	return p, p
 }
 
-func (f *Pipe) raise() {
+func (f *pipe) raise() {
 	select {
 	case <-f.closed:
 		return
@@ -35,7 +69,7 @@ func (f *Pipe) raise() {
 	}
 }
 
-func (f *Pipe) close() {
+func (f *pipe) close() {
 	select {
 	case <-f.closed:
 		return
@@ -45,23 +79,26 @@ func (f *Pipe) close() {
 	}
 }
 
-func (f *Pipe) Close() error {
+// Close closes the pipe, rendering it unusable for I/O.
+func (f *pipe) Close() error {
 	f.close()
 	return nil
 }
 
-func (f *Pipe) Write(p []byte) (int, error) {
+// Write writes len(p) bytes from p to the pipe. It returns the number of bytes written. If pipe is closed
+// or buffer is full, it returns ErrClosedPipe or ErrBufferFull respectively.
+func (f *pipe) Write(p []byte) (int, error) {
 	select {
 	case <-f.closed:
-		return 0, io.ErrClosedPipe
+		return 0, ErrClosedPipe
 	default:
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.buf.Len() > f.maxSize {
-		f.err = io.ErrShortBuffer
+	if f.maxSize > 0 && f.buf.Len() > f.maxSize {
+		f.err = ErrBufferFull
 		f.close()
 		return 0, f.err
 	}
@@ -72,9 +109,12 @@ func (f *Pipe) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func (f *Pipe) Read(p []byte) (int, error) {
+// Read reads up to len(p) bytes into p. It returns the number of bytes
+// read (0 <= n <= len(p)) and any error encountered on the write side of the pipe.
+// Read returns io.EOF when the write side has been closed.
+func (f *pipe) Read(p []byte) (int, error) {
 
-	// wait for whatever sygnal trick
+	// wait for whatever signal trick
 	select {
 	case <-f.flag:
 	case <-f.closed:
@@ -106,14 +146,9 @@ func (f *Pipe) Read(p []byte) (int, error) {
 
 }
 
-func (f *Pipe) Len() int {
+// Len returns the number of bytes of the unread portion of the underlying buffer
+func (f *pipe) Len() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.buf.Len()
-}
-
-func (f *Pipe) Cap() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.buf.Cap()
 }
