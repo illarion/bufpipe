@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 )
 
 var (
@@ -14,15 +15,33 @@ var (
 	ErrClosedPipe = errors.New("bufpipe: closed pipe")
 )
 
-const defaultBufSize = 4096
+const internalBufSize = 4096
+
+type Options struct {
+	// MaxSize is the maximum size of the buffer. Write will return ErrBufferFull
+	// if the buffer is full. If MaxSize is 0, buffer is unlimited. Default is 0.
+	MaxSize int
+	// BlockWritesUntilFirstRead if set to true, Write will block until the first Read is called. This is useful
+	// if you want to make sure that the reader is ready to read before writing to the pipe. Default is false.
+	BlockWritesUntilFirstRead bool
+	// BlockWritesOnFullBufferTimeout if set to a non-zero value, Write will block until the buffer is not full. This is useful
+	// if you want to make sure that the reader has read some data before writing more. Default is no timeout.
+	// Only works if MaxSize is set to a non-zero value. If the timeout is reached, Write will return ErrBufferFull
+	BlockWritesOnFullBufferTimeout time.Duration
+}
 
 type pipe struct {
-	maxSize        int
-	blockOnMaxSize bool
-	buf            *bytes.Buffer
-	flag           chan struct{}
-	closed         chan struct{}
-	err            error
+	Options
+
+	buf *bytes.Buffer
+
+	flagWritten chan struct{}
+	flagRead    chan struct{}
+
+	closed    chan struct{}
+	firstRead chan struct{}
+
+	err error
 
 	mu sync.Mutex
 }
@@ -40,31 +59,47 @@ type PipeWriter interface {
 
 // Pipe creates a buffered in-memory pipe. It can be used to connect code expecting an io.Reader with
 // code expecting an io.Writer, but unlike io.Pipe it has internal buffer and can be used to pass
-// data between goroutines without blocking. If maxSize > 0, the buffer will be limited to that size, and
-// Write will return ErrBufferFull if the buffer is full. If maxSize is 0, buffer is unlimited.
-func Pipe(maxSize int) (PipeReader, PipeWriter) {
-	size := maxSize
-	if maxSize <= 0 {
-		size = defaultBufSize
+// data between goroutines without blocking.
+func Pipe(options Options) (PipeReader, PipeWriter) {
+	internalSize := options.MaxSize
+	if internalSize <= 0 {
+		internalSize = internalBufSize
 	}
-	buf := make([]byte, 0, size)
+	buf := make([]byte, 0, internalSize)
 
 	p := &pipe{
-		maxSize: maxSize,
+		Options: options,
 		buf:     bytes.NewBuffer(buf),
-		flag:    make(chan struct{}, 1),
-		closed:  make(chan struct{}),
-		err:     nil,
+
+		flagWritten: make(chan struct{}, 1),
+		flagRead:    make(chan struct{}, 1),
+		firstRead:   make(chan struct{}),
+
+		closed: make(chan struct{}),
+		err:    nil,
+	}
+
+	if !options.BlockWritesUntilFirstRead {
+		close(p.firstRead)
 	}
 
 	return p, p
 }
 
-func (f *pipe) raise() {
+func (f *pipe) raiseWritten() {
 	select {
 	case <-f.closed:
 		return
-	case f.flag <- struct{}{}:
+	case f.flagWritten <- struct{}{}:
+	default:
+	}
+}
+
+func (f *pipe) raiseRead() {
+	select {
+	case <-f.closed:
+		return
+	case f.flagRead <- struct{}{}:
 	default:
 	}
 }
@@ -74,7 +109,8 @@ func (f *pipe) close() {
 	case <-f.closed:
 		return
 	default:
-		f.raise()
+		f.raiseWritten()
+		f.raiseRead()
 		close(f.closed)
 	}
 }
@@ -94,18 +130,50 @@ func (f *pipe) Write(p []byte) (int, error) {
 	default:
 	}
 
+	if f.BlockWritesUntilFirstRead {
+		select {
+		case <-f.closed:
+			return 0, ErrClosedPipe
+		case <-f.firstRead:
+		}
+	}
+
+	if f.MaxSize > 0 && f.buf.Len()+len(p) > f.MaxSize {
+
+		if f.BlockWritesOnFullBufferTimeout == 0 {
+			f.err = ErrBufferFull
+			f.close()
+			return 0, f.err
+		}
+
+		// block until timeout --> error, or until read happened and freed enough space --> continue
+		haveSpace := false
+		deadline := time.Now().Add(f.BlockWritesOnFullBufferTimeout)
+
+		for !haveSpace {
+			f.raiseWritten() // make sure the reader is ready to read
+			select {
+			case <-f.closed:
+				return 0, ErrClosedPipe
+			case <-time.After(time.Until(deadline)):
+				f.err = ErrBufferFull
+				f.close()
+				return 0, f.err
+			case <-f.flagRead:
+				if f.buf.Len()+len(p) <= f.MaxSize {
+					haveSpace = true
+				}
+			}
+		}
+
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.maxSize > 0 && f.buf.Len() > f.maxSize {
-		f.err = ErrBufferFull
-		f.close()
-		return 0, f.err
-	}
-
 	n, _ := f.buf.Write(p)
 
-	f.raise()
+	f.raiseWritten()
 	return n, nil
 }
 
@@ -114,9 +182,17 @@ func (f *pipe) Write(p []byte) (int, error) {
 // Read returns io.EOF when the write side has been closed.
 func (f *pipe) Read(p []byte) (int, error) {
 
+	if f.BlockWritesUntilFirstRead {
+		select {
+		case <-f.firstRead:
+		default:
+			close(f.firstRead)
+		}
+	}
+
 	// wait for whatever signal trick
 	select {
-	case <-f.flag:
+	case <-f.flagWritten:
 	case <-f.closed:
 	}
 
@@ -126,6 +202,8 @@ func (f *pipe) Read(p []byte) (int, error) {
 		f.err = nil
 		return 0, err
 	}
+
+	defer f.raiseRead()
 
 	// check if closed
 	select {
@@ -138,7 +216,7 @@ func (f *pipe) Read(p []byte) (int, error) {
 
 		n, _ := f.buf.Read(p)
 		if f.buf.Len() != 0 {
-			f.raise()
+			f.raiseWritten() // signal that there is more data to read
 		}
 
 		return n, nil
