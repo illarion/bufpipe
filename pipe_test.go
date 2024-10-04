@@ -50,7 +50,7 @@ func TestPipeWriteFailsOnMaxSize(t *testing.T) {
 
 func TestPipeWriteBlocksUntilFirstRead(t *testing.T) {
 	r, w := Pipe(Options{
-		BlockWritesUntilFirstRead: true,
+		BlockWritesUntilFirstReadTimeout: 200 * time.Millisecond,
 	})
 
 	data := []byte("Hello, World!")
@@ -173,4 +173,78 @@ func TestPipeBlocksOnFullBufferTimeoutAndCompletesWithNoErrorIfReadEmptiesBuffer
 	if writeErr != nil {
 		t.Errorf("Expected no error, got %v", writeErr)
 	}
+}
+
+func TestPipeBlocksOnFullBufferAndBlockUntilFirstRead(t *testing.T) {
+
+	r, w := Pipe(Options{
+		MaxSize:                          5,
+		BlockWritesOnFullBufferTimeout:   200 * time.Millisecond,
+		BlockWritesUntilFirstReadTimeout: 400 * time.Millisecond,
+	})
+
+	write1Done := make(chan struct{})
+	var writeErr error
+
+	go func() {
+		// Write should block until first read
+		defer close(write1Done)
+		_, writeErr = w.Write([]byte("1"))
+	}()
+
+	select {
+	case <-write1Done:
+		t.Errorf("Write completed before first read timeout")
+		return
+	case <-time.After(300 * time.Millisecond):
+		// Expected timeout, bigger than BlockWritesOnFullBufferTimeout, write should block
+	}
+
+	buf := make([]byte, 5)
+	_, err := r.Read(buf)
+	if err != nil {
+		t.Errorf("Error reading from pipe: %v", err)
+		return
+	}
+
+	// Write should complete after first read
+	<-write1Done
+
+	if writeErr != nil {
+		t.Errorf("Expected no error, got %v", writeErr)
+	}
+
+	write2Done := make(chan struct{})
+
+	go func() {
+		// Write should block until first read
+		defer close(write2Done)
+		_, writeErr = w.Write([]byte("12345")) // 5 bytes, buffer full
+		if writeErr != nil {
+			return
+		}
+		_, writeErr = w.Write([]byte("6")) // 6th byte, should block until read empties buffer
+	}()
+
+	select {
+	case <-write2Done:
+		t.Errorf("Write completed before buffer timeout, with error: %v", writeErr)
+		return
+	case <-time.After(100 * time.Millisecond):
+		// write will block until read empties buffer
+	}
+
+	buf = make([]byte, 5)
+	_, err = r.Read(buf)
+	if err != nil {
+		t.Errorf("Error reading from pipe: %v", err)
+		return
+	}
+
+	<-write2Done
+
+	if writeErr != nil {
+		t.Errorf("Expected no error, got %v", writeErr)
+	}
+
 }

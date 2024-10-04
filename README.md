@@ -18,7 +18,7 @@ func main() {
     // Create a new buffered pipe
     reader, writer := bufpipe.Pipe(bufpipe.Options{
         MaxSize: 1024,
-        BlockWritesUntilFirstRead: true,
+        BlockWritesUntilFirstReadTimeout: time.Second * 5,
 		BlockWritesOnFullBufferTimeout: time.Second * 5,
     })
 
@@ -39,12 +39,13 @@ func main() {
 ## Options
 
 - `MaxSize` - the maximum size of the buffer in bytes. Default is 0 - no limit.
-- `BlockWritesUntilFirstRead` - if set to true, the writer will block until the first read from the reader. Default is false.
-- `BlockWritesOnFullBufferTimeout` - if set, the writer will block until the buffer is not full or the timeout is reached. Default is 0 - no timeout.
+- `BlockWritesUntilFirstReadTimeout` - if set, the writer will block until the first read from the reader or the timeout is reached. Default is 0 - no blocking, write immediately.
+- `BlockWritesOnFullBufferTimeout` - if set, the writer will block until the buffer is not full or the timeout is reached. Default is 0 - immediately return `ErrBufferFull` if the buffer is full.
 
 ## Errors
 `ErrBufferFull` - returned when reader is slower than writer and there is no place to write
 `ErrClosedPipe` - returned if either reader or writer side is closed.
+`ErrFirstReadTimeout` - returned if the `BlockWritesUntilFirstReadTimeout` is reached.
 
 
 ## License

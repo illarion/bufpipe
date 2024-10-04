@@ -10,9 +10,11 @@ import (
 
 var (
 	// ErrBufferFull is returned when the buffer is full
-	ErrBufferFull = errors.New("bufpipe: buffer full")
+	ErrBufferFull = errors.New("bufpipe: buffer is full")
 	// ErrClosedPipe is returned when the pipe is closed
 	ErrClosedPipe = errors.New("bufpipe: closed pipe")
+	// ErrFirstReadTimeout is returned when the pipe is set to block writes until the first read, but the timeout is reached
+	ErrFirstReadTimeout = errors.New("bufpipe: write blocked because first read didn't happen until timeout")
 )
 
 const internalBufSize = 4096
@@ -21,11 +23,11 @@ type Options struct {
 	// MaxSize is the maximum size of the buffer. Write will return ErrBufferFull
 	// if the buffer is full. If MaxSize is 0, buffer is unlimited. Default is 0.
 	MaxSize int
-	// BlockWritesUntilFirstRead if set to true, Write will block until the first Read is called. This is useful
+	// BlockWritesUntilFirstReadTimeout if set to a non-zero value, Write will block until the first Read is called. This is useful
 	// if you want to make sure that the reader is ready to read before writing to the pipe. Default is false.
-	BlockWritesUntilFirstRead bool
-	// BlockWritesOnFullBufferTimeout if set to a non-zero value, Write will block until the buffer is not full. This is useful
-	// if you want to make sure that the reader has read some data before writing more. Default is no timeout.
+	BlockWritesUntilFirstReadTimeout time.Duration
+	// BlockWritesOnFullBufferTimeout if set to a non-zero value, Write will block until the buffer is emptied by some Read() calls.
+	// This is useful if you want to make sure that the reader has read some data before writing more. Default is no timeout - return ErrBufferFull immediately.
 	// Only works if MaxSize is set to a non-zero value. If the timeout is reached, Write will return ErrBufferFull
 	BlockWritesOnFullBufferTimeout time.Duration
 }
@@ -79,7 +81,7 @@ func Pipe(options Options) (PipeReader, PipeWriter) {
 		err:    nil,
 	}
 
-	if !options.BlockWritesUntilFirstRead {
+	if options.BlockWritesUntilFirstReadTimeout == 0 {
 		close(p.firstRead)
 	}
 
@@ -130,10 +132,12 @@ func (f *pipe) Write(p []byte) (int, error) {
 	default:
 	}
 
-	if f.BlockWritesUntilFirstRead {
+	if f.BlockWritesUntilFirstReadTimeout > 0 {
 		select {
 		case <-f.closed:
 			return 0, ErrClosedPipe
+		case <-time.After(f.BlockWritesUntilFirstReadTimeout):
+			return 0, ErrFirstReadTimeout
 		case <-f.firstRead:
 		}
 	}
@@ -182,7 +186,7 @@ func (f *pipe) Write(p []byte) (int, error) {
 // Read returns io.EOF when the write side has been closed.
 func (f *pipe) Read(p []byte) (int, error) {
 
-	if f.BlockWritesUntilFirstRead {
+	if f.BlockWritesUntilFirstReadTimeout > 0 {
 		select {
 		case <-f.firstRead:
 		default:
